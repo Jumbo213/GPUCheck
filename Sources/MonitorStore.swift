@@ -17,11 +17,13 @@ final class MonitorStore: ObservableObject {
     @Published var lastUpdated: [UUID: Date] = [:]
     @Published var refreshing = false
     @Published var storageWarning: String?
+    private var inFlight: Set<UUID> = []
     private var pollTask: Task<Void, Never>?
     private let client = SSHClient()
     private var repository: HistoryRepository?
     private let configURL: URL
     private var lastPrune = Date.distantPast
+    private var deviceCache: [String: [HistoryDevice]] = [:]
     private var chartCache: [String: [HistorySample]] = [:]
     private var lastSnapshotPersistence: [UUID: Date] = [:]
     private var cachedLatestURL: URL { configURL.deletingLastPathComponent().appendingPathComponent("latest.json") }
@@ -47,6 +49,7 @@ final class MonitorStore: ObservableObject {
                 if let cached = try? decoder.decode([UUID: Snapshot].self, from: data) {
                     snapshots = cached.filter { id, _ in servers.contains { $0.id == id } }
                     for (id, snapshot) in snapshots {
+                        try repository?.registerDevices(snapshot, serverID: id)
                         lastUpdated[id] = snapshot.timestamp
                         errors[id] = "正在重新连接；当前显示上次采集的数据。"
                     }
@@ -66,7 +69,7 @@ final class MonitorStore: ObservableObject {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard self != nil else { return }
-                await self?.poll()
+                self?.refresh()
                 do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
             }
         }
@@ -75,10 +78,11 @@ final class MonitorStore: ObservableObject {
     func refresh() { Task { await poll() } }
 
     private func poll() async {
-        guard !refreshing else { return }
+        let targets = servers.filter { !inFlight.contains($0.id) }
+        guard !targets.isEmpty else { return }
+        inFlight.formUnion(targets.map(\.id))
         refreshing = true
-        defer { refreshing = false }
-        let targets = servers
+        defer { refreshing = !inFlight.isEmpty }
         await withTaskGroup(of: (Server, Result<Snapshot, Error>).self) { group in
             for server in targets {
                 group.addTask { [client] in
@@ -87,6 +91,7 @@ final class MonitorStore: ObservableObject {
                 }
             }
             for await (server, result) in group {
+                inFlight.remove(server.id)
                 guard servers.contains(server) else { continue }
                 switch result {
                 case .success(let snapshot): record(snapshot, for: server)
@@ -162,24 +167,38 @@ final class MonitorStore: ObservableObject {
         try await client.inspect(process, server: server)
     }
 
-    func samples(serverID: UUID, gpuUUID: String, since: Date) -> [HistorySample] {
-        let range = Int(max(0, Date().timeIntervalSince(since)).rounded())
-        let tick = Int(Date().timeIntervalSince1970 / 30)
-        let key = "\(serverID.uuidString)|\(gpuUUID)|\(range)|\(tick)"
+    func historyEndDate(serverID: UUID) -> Date {
+        if errors[serverID] == nil, snapshots[serverID] != nil { return Date() }
+        let latest = max(lastUpdated[serverID] ?? .distantPast, repository?.latestDate(serverID: serverID) ?? .distantPast)
+        return latest == .distantPast ? Date() : latest
+    }
+
+    func historyDevices(serverID: UUID, since: Date, until: Date) -> [HistoryDevice] {
+        let key = "\(serverID)|\(Int(since.timeIntervalSince1970 / 30))|\(Int(until.timeIntervalSince1970 / 30))"
+        if let cached = deviceCache[key] { return cached }
+        let values = repository?.devices(serverID: serverID, since: since, until: until) ?? []
+        if deviceCache.count > 100 { deviceCache.removeAll(keepingCapacity: true) }
+        deviceCache[key] = values
+        return values
+    }
+
+    func samples(serverID: UUID, gpuUUID: String, since: Date, until: Date = Date()) -> [HistorySample] {
+        let key = "\(serverID)|\(gpuUUID)|\(Int(since.timeIntervalSince1970 / 30))|\(Int(until.timeIntervalSince1970 / 30))"
         if let cached = chartCache[key] { return cached }
-        let values = repository?.samples(serverID: serverID, gpuUUID: gpuUUID, since: since) ?? history.filter { $0.serverID == serverID && $0.gpuUUID == gpuUUID && $0.timestamp >= since }
+        let values = repository?.samples(serverID: serverID, gpuUUID: gpuUUID, since: since, until: until) ?? history.filter { $0.serverID == serverID && $0.gpuUUID == gpuUUID && $0.timestamp >= since && $0.timestamp <= until }
         if chartCache.count > 100 { chartCache.removeAll(keepingCapacity: true) }
         chartCache[key] = values
         return values
     }
 
     private func record(_ snapshot: Snapshot, for server: Server) {
+        deviceCache.removeAll(keepingCapacity: true)
         chartCache.removeAll(keepingCapacity: true)
         snapshots[server.id] = snapshot; errors[server.id] = nil; lastUpdated[server.id] = snapshot.timestamp
         let samples = snapshot.gpus.map { gpu in
             HistorySample(timestamp: snapshot.timestamp, serverID: server.id, gpuUUID: gpu.id, utilization: gpu.utilization, memoryUsed: gpu.memoryUsed, memoryTotal: gpu.memoryTotal, temperature: gpu.temperature, powerDraw: gpu.powerDraw)
         }
-        do { try repository?.insert(samples) }
+        do { try repository?.insert(samples); try repository?.registerDevices(snapshot, serverID: server.id) }
         catch { storageWarning = "历史记录保存失败：\(error.localizedDescription)" }
         history.removeAll { $0.timestamp < Date().addingTimeInterval(-3600) }
         history.append(contentsOf: samples)
@@ -220,6 +239,8 @@ final class HistoryRepository {
         try execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
         try execute("CREATE TABLE IF NOT EXISTS samples (id TEXT PRIMARY KEY, server TEXT NOT NULL, gpu TEXT NOT NULL, timestamp REAL NOT NULL, utilization REAL, memory_used REAL, memory_total REAL, temperature REAL, power REAL);")
         try execute("CREATE INDEX IF NOT EXISTS sample_lookup ON samples(server,gpu,timestamp); CREATE INDEX IF NOT EXISTS sample_time ON samples(timestamp);")
+        try execute("CREATE INDEX IF NOT EXISTS sample_server_time ON samples(server,timestamp,gpu);")
+        try execute("CREATE TABLE IF NOT EXISTS gpu_devices (server TEXT NOT NULL, gpu TEXT NOT NULL, gpu_index INTEGER, name TEXT, PRIMARY KEY(server,gpu));")
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
     deinit { if let database { sqlite3_close(database) } }
@@ -260,15 +281,46 @@ final class HistoryRepository {
         return result
     }
 
-    func samples(serverID: UUID, gpuUUID: String, since: Date) -> [HistorySample] {
+    func registerDevices(_ snapshot: Snapshot, serverID: UUID) throws {
+        let statement = try prepare("INSERT INTO gpu_devices VALUES(?,?,?,?) ON CONFLICT(server,gpu) DO UPDATE SET gpu_index=excluded.gpu_index,name=excluded.name;")
+        defer { sqlite3_finalize(statement) }
+        for gpu in snapshot.gpus {
+            sqlite3_reset(statement); sqlite3_clear_bindings(statement)
+            bind(serverID.uuidString, 1, statement); bind(gpu.id, 2, statement)
+            sqlite3_bind_int(statement, 3, Int32(gpu.index)); bind(gpu.name, 4, statement)
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw GPUCheckError("设备历史信息保存失败。") }
+        }
+    }
+
+    func latestDate(serverID: UUID) -> Date? {
+        guard let statement = try? prepare("SELECT MAX(timestamp) FROM samples WHERE server=?;") else { return nil }
+        defer { sqlite3_finalize(statement) }; bind(serverID.uuidString, 1, statement)
+        guard sqlite3_step(statement) == SQLITE_ROW, let time = number(statement, 0) else { return nil }
+        return Date(timeIntervalSince1970: time)
+    }
+
+    func devices(serverID: UUID, since: Date, until: Date) -> [HistoryDevice] {
+        let sql = "SELECT s.gpu,d.gpu_index,d.name,MAX(s.memory_total),MAX(s.timestamp) FROM samples s LEFT JOIN gpu_devices d ON d.server=s.server AND d.gpu=s.gpu WHERE s.server=? AND s.timestamp>=? AND s.timestamp<=? GROUP BY s.gpu ORDER BY MAX(s.timestamp) DESC,s.gpu;"
+        guard let statement = try? prepare(sql) else { return [] }
+        defer { sqlite3_finalize(statement) }
+        bind(serverID.uuidString, 1, statement)
+        sqlite3_bind_double(statement, 2, since.timeIntervalSince1970); sqlite3_bind_double(statement, 3, until.timeIntervalSince1970)
+        var values: [HistoryDevice] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            values.append(HistoryDevice(id: string(statement, 0), index: number(statement, 1).map(Int.init), name: string(statement, 2), memoryTotal: number(statement, 3), lastSeen: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4))))
+        }
+        return values
+    }
+
+    func samples(serverID: UUID, gpuUUID: String, since: Date, until: Date = Date()) -> [HistorySample] {
         // Aggregate long ranges while preserving chronology; no forward-fill across outages.
-        let duration = max(1, Date().timeIntervalSince(since))
+        let duration = max(1, until.timeIntervalSince(since))
         let bucket = max(1, ceil(duration.rounded() / 1500))
-        let sql = "SELECT MIN(id),MIN(timestamp),AVG(utilization),AVG(memory_used),MAX(memory_total),AVG(temperature),AVG(power) FROM samples WHERE server=? AND gpu=? AND timestamp>=? GROUP BY CAST(timestamp/? AS INTEGER) ORDER BY MIN(timestamp);"
+        let sql = "SELECT MIN(id),MIN(timestamp),AVG(utilization),AVG(memory_used),MAX(memory_total),AVG(temperature),AVG(power) FROM samples WHERE server=? AND gpu=? AND timestamp>=? AND timestamp<=? GROUP BY CAST(timestamp/? AS INTEGER) ORDER BY MIN(timestamp);"
         guard let statement = try? prepare(sql) else { return [] }
         defer { sqlite3_finalize(statement) }
         bind(serverID.uuidString, 1, statement); bind(gpuUUID, 2, statement)
-        sqlite3_bind_double(statement, 3, since.timeIntervalSince1970); sqlite3_bind_double(statement, 4, bucket)
+        sqlite3_bind_double(statement, 3, since.timeIntervalSince1970); sqlite3_bind_double(statement, 4, until.timeIntervalSince1970); sqlite3_bind_double(statement, 5, bucket)
         var result: [HistorySample] = []
         while sqlite3_step(statement) == SQLITE_ROW {
             result.append(HistorySample(id: UUID(uuidString: string(statement, 0)) ?? UUID(), timestamp: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)), serverID: serverID, gpuUUID: gpuUUID, utilization: number(statement, 2), memoryUsed: number(statement, 3), memoryTotal: number(statement, 4), temperature: number(statement, 5), powerDraw: number(statement, 6)))

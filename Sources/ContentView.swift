@@ -183,7 +183,7 @@ struct ContentView: View {
                 MetricCard(title: "最高温度", value: numeric(gpus.compactMap(\.temperature).max()), unit: "°C", icon: "thermometer.medium", color: Color(red: 0.88, green: 0.56, blue: 0.23), progress: (gpus.compactMap(\.temperature).max() ?? 0) / 100, footnote: "当前各卡最高温度")
                 MetricCard(title: "总功耗", value: numeric(total(gpus.compactMap(\.powerDraw))), unit: "W", icon: "bolt", color: Color(red: 0.62, green: 0.39, blue: 0.86), progress: powerRatio(gpus), footnote: "功耗上限 \(numeric(total(gpus.compactMap(\.powerLimit)))) W")
             }
-            if let server = store.selectedServer { HistoryChartCard(store: store, server: server, snapshot: snapshot, compact: true) }
+            if let server = store.selectedServer { HistoryChartCard(store: store, server: server, compact: true) }
             HStack { Text("GPU 设备").font(.system(size: 16, weight: .bold)); Text("\(gpus.count) 张").font(.system(size: 11)).foregroundStyle(Color.muted); Spacer(); Text("点击设备查看完整参数").font(.system(size: 11)).foregroundStyle(Color.muted) }
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 14),GridItem(.flexible(), spacing: 14)], spacing: 14) {
                 ForEach(gpus) { gpu in GPUCard(gpu: gpu, isStale: store.selectedServerID.flatMap { store.errors[$0] } != nil) { gpuSelection = GPUSelection(gpu: gpu, snapshot: snapshot) } }
@@ -208,9 +208,9 @@ struct ContentView: View {
         }
     }
     @ViewBuilder var historyPage: some View {
-        if let server = store.selectedServer, let snapshot = store.selectedSnapshot {
-            snapshotHeading(snapshot)
-            HistoryChartCard(store: store, server: server, snapshot: snapshot, compact: false)
+        if let server = store.selectedServer {
+            if let snapshot = store.selectedSnapshot { snapshotHeading(snapshot) }
+            HistoryChartCard(store: store, server: server, compact: false)
             InfoNote(text: "历史数据保存在这台 Mac，保留最近 30 天。仅在应用运行且服务器连接正常时采集；离线和休眠期间留空，不补造数据。")
         } else { waitingView }
     }

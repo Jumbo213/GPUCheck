@@ -85,3 +85,12 @@ struct GPUCheckError: LocalizedError, Sendable {
     var errorDescription: String? { message }
     init(_ message: String) { self.message = message }
 }
+
+struct HistoryDevice: Identifiable {
+    var id: String
+    var index: Int?
+    var name: String
+    var memoryTotal: Double?
+    var lastSeen: Date
+    var label: String { "\(index.map { "GPU \($0)" } ?? "历史 GPU") · \(id.suffix(6))" }
+}

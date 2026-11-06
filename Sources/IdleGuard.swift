@@ -5,6 +5,7 @@ struct IdleGuardState {
     var enabled = false
     var status = "未启用"
     var detail = "可选功能：连续观察全部 GPU 空闲 5 小时后，运行最多 5 分钟的显存与计算负载。"
+    var idleSeconds: TimeInterval = 0
     var idleSince: Date?
     var runningUntil: Date?
     var busy = false
@@ -18,6 +19,8 @@ private struct IdleGuardRun: Codable {
 }
 private struct IdleGuardSetting: Codable {
     var enabled = false
+    var idleSeconds: TimeInterval?
+    var retryAfter: Date?
     var active: IdleGuardRun?
 }
 private struct IdleGuardRemoteReply: Decodable {
@@ -36,21 +39,25 @@ final class IdleGuardManager: ObservableObject {
     private let settingsURL: URL
     private var settings: [UUID: IdleGuardSetting] = [:]
     private var pollTask: Task<Void, Never>?
+    private let requiredIdleDuration: TimeInterval
+    private var lastProgressSave = Date.distantPast
     private var previousTick: Date?
+    private var busySince: [UUID: Date] = [:]
     private var lastSample: [UUID: Date] = [:]
 
-    init(store: MonitorStore) {
+    init(store: MonitorStore, settingsURL: URL? = nil, idleDuration: TimeInterval = 5 * 3600) {
         self.store = store
-        settingsURL = SSHClient.applicationDirectory.appendingPathComponent("idle-guard.json")
-        if let data = try? Data(contentsOf: settingsURL), let saved = try? JSONDecoder().decode([UUID: IdleGuardSetting].self, from: data) { settings = saved }
+        self.settingsURL = settingsURL ?? SSHClient.applicationDirectory.appendingPathComponent("idle-guard.json")
+        requiredIdleDuration = idleDuration
+        if let data = try? Data(contentsOf: self.settingsURL), let saved = try? JSONDecoder().decode([UUID: IdleGuardSetting].self, from: data) { settings = saved }
         for server in store.servers {
             let setting = settings[server.id] ?? IdleGuardSetting()
-            var state = IdleGuardState(); state.enabled = setting.enabled
+            var state = IdleGuardState(); state.enabled = setting.enabled; state.idleSeconds = max(0, setting.idleSeconds ?? 0)
             if let active = setting.active {
                 state.isRunning = true; state.runningUntil = active.deadline; state.status = "正在核对远端任务"
                 state.detail = "上次任务由远端独立看门狗限制为最多 5 分钟。"
             } else if setting.enabled {
-                state.status = "等待新采样"; state.detail = "重启后重新累计连续空闲时间。"
+                state.status = "等待新采样"; state.detail = "继续累计已保存的在线空闲时间。"
             }
             states[server.id] = state
         }
@@ -88,7 +95,7 @@ final class IdleGuardManager: ObservableObject {
             try saveSettings()
             change(server.id) {
                 $0.enabled = true; $0.idleSince = nil; $0.status = "等待连续空闲"
-                $0.detail = "环境检查通过；全部 GPU 连续空闲 5 小时才会触发。断连、休眠或忙碌会重新计时。"
+                $0.detail = "环境检查通过；全部 GPU 连续空闲 5 小时才会触发。断连或休眠暂停累计，检测到 GPU 忙碌时重新计时。"
             }
             lastSample[server.id] = nil
         } catch {
@@ -147,30 +154,69 @@ final class IdleGuardManager: ObservableObject {
                 guard reply.ok else { throw GPUCheckError(reply.detail ?? "无法确认远端任务状态。") }
                 if reply.status == "running" || reply.status == "starting" {
                     change(id) { $0.isRunning = true; $0.idleSince = nil; $0.runningUntil = Date().addingTimeInterval(max(0, reply.remaining ?? 0)); $0.status = reply.status == "starting" ? "正在准备负载" : "正在运行 5 分钟负载"; $0.detail = reply.detail ?? "远端看门狗独立计时；发现外部计算进程会提前结束。" }
-                } else { finish(id, detail: reply.detail ?? "本轮任务已结束；连续空闲时间重新累计。") }
+                } else { finish(id, detail: reply.detail ?? "本轮任务已结束。", retry: reply.status == "cancelled") }
             } catch {
                 guard settings[id]?.active?.token == run.token else { continue }
                 change(id) { $0.idleSince = nil; $0.status = "远端任务状态待确认"; $0.detail = "\(error.localizedDescription) 任务有独立 5 分钟期限。" }
             }
         }
-        for server in servers {
+        for server in servers where !activeIDs.contains(server.id) {
             let id = server.id
             if states[id] == nil { states[id] = IdleGuardState() }
             guard settings[id]?.enabled == true, settings[id]?.active == nil, !(states[id]?.busy ?? false) else { continue }
             guard !interrupted, store.errors[id] == nil, let snapshot = store.snapshots[id], now.timeIntervalSince(snapshot.timestamp) >= 0, now.timeIntervalSince(snapshot.timestamp) <= 20 else {
-                change(id) { $0.idleSince = nil; $0.status = "等待连续采样"; $0.detail = "连接中断、采样过期或 Mac 休眠后会重新累计 5 小时。" }
-                lastSample[id] = nil; continue
-            }
-            let gap = lastSample[id].map { snapshot.timestamp.timeIntervalSince($0) } ?? 0
-            lastSample[id] = snapshot.timestamp
-            if gap > 20 || gap < 0 { change(id) { $0.idleSince = nil } }
-            guard Self.isIdle(snapshot) else {
-                change(id) { $0.idleSince = nil; $0.status = "GPU 使用中"; $0.detail = "仅按利用率判断：需全部 GPU 利用率连续 5 小时 ≤2%，不检查显存占用或已有进程。" }
+                change(id) { $0.idleSince = nil; $0.status = "计时已暂停，等待连接"; $0.detail = "已累计的在线空闲时间会保留，恢复有效采样后继续。" }
+                lastSample[id] = nil
+                busySince[id] = nil
                 continue
             }
-            change(id) { if $0.idleSince == nil { $0.idleSince = now }; $0.status = "正在累计空闲时间"; $0.detail = "连续空闲满 5 小时后，全卡运行最多 5 分钟；任何忙碌或采样中断都会清零。" }
-            if Self.thresholdReached(idleSince: states[id]?.idleSince, now: now) { await launch(for: server) }
+            let previous = lastSample[id]
+            lastSample[id] = snapshot.timestamp
+            guard Self.isIdle(snapshot) else {
+                lastSample[id] = nil
+                let validLoads = snapshot.gpus.compactMap(\.utilization).filter { $0.isFinite && $0 >= 0 }
+                guard validLoads.count == snapshot.gpus.count else {
+                    busySince[id] = nil
+                    change(id) { $0.idleSince = nil; $0.status = "利用率读数不可用，暂停计时" }
+                    continue
+                }
+                let firstBusy = busySince[id] ?? snapshot.timestamp
+                busySince[id] = firstBusy
+                let sustained = snapshot.timestamp.timeIntervalSince(firstBusy)
+                if Self.shouldResetIdle(peakUtilization: validLoads.max() ?? 0, busySeconds: sustained) {
+                    settings[id]?.idleSeconds = 0
+                    settings[id]?.retryAfter = nil
+                    change(id) { $0.idleSince = nil; $0.idleSeconds = 0; $0.status = "GPU 使用中"; $0.detail = "利用率达到 10%，或连续高于 2% 达 15 秒，重新累计空闲时间。" }
+                } else {
+                    change(id) { $0.idleSince = nil; $0.status = "检测到瞬时负载，暂停计时"; $0.detail = "短暂的小幅波动保留已累计时间，恢复 ≤2% 后继续。" }
+                }
+                continue
+            }
+            busySince[id] = nil
+            if let retryAfter = settings[id]?.retryAfter, retryAfter > now {
+                change(id) { $0.idleSince = nil; $0.status = "等待可用资源后重试" }
+                continue
+            }
+            let credited = Self.creditedInterval(previous: previous, current: snapshot.timestamp)
+            let elapsed = max(0, settings[id]?.idleSeconds ?? 0) + credited
+            settings[id]?.idleSeconds = elapsed
+            change(id) { $0.idleSeconds = elapsed; $0.idleSince = now.addingTimeInterval(-elapsed); $0.status = "正在累计在线空闲时间"; $0.detail = "累计满 5 小时触发；断连或休眠暂停计时，持续高于 2% 达 15 秒或达到 10% 时清零。" }
+            if elapsed >= requiredIdleDuration { await launch(for: server) }
         }
+        if now.timeIntervalSince(lastProgressSave) >= 15 {
+            do { try saveSettings(); lastProgressSave = now }
+            catch { for server in servers { change(server.id) { $0.detail = "计时保存失败：\(error.localizedDescription)" } } }
+        }
+    }
+
+    static func shouldResetIdle(peakUtilization: Double, busySeconds: TimeInterval) -> Bool {
+        peakUtilization >= 10 || busySeconds >= 15
+    }
+
+    static func creditedInterval(previous: Date?, current: Date) -> TimeInterval {
+        guard let previous else { return 0 }
+        let seconds = current.timeIntervalSince(previous)
+        return seconds >= 0 && seconds <= 20 ? seconds : 0
     }
 
     private func launch(for server: Server) async {
@@ -181,6 +227,7 @@ final class IdleGuardManager: ObservableObject {
         var remoteAttempted = false
         do {
             var pending = settings[server.id] ?? IdleGuardSetting()
+            pending.idleSeconds = 0
             pending.active = IdleGuardRun(token: token, server: server, deadline: pendingDeadline)
             settings[server.id] = pending
             try saveSettings()
@@ -194,17 +241,25 @@ final class IdleGuardManager: ObservableObject {
         } catch {
             let stopped = remoteAttempted ? try? await request(server, script: Self.controlScript(token: token, stop: true), timeout: 18) : nil
             if !remoteAttempted || stopped?.ok == true {
-                settings[server.id]?.active = nil; try? saveSettings()
-                change(server.id) { $0.isRunning = false; $0.runningUntil = nil; $0.status = "本轮未启动或已停止"; $0.detail = error.localizedDescription }
+                finish(server.id, detail: error.localizedDescription, retry: remoteAttempted)
             } else {
                 change(server.id) { $0.isRunning = true; $0.runningUntil = pendingDeadline; $0.status = "启动状态待确认"; $0.detail = "\(error.localizedDescription) 已保留任务令牌，将继续核对；远端任务最多运行 5 分钟。" }
             }
         }
     }
 
-    private func finish(_ id: UUID, detail: String) {
+    private func finish(_ id: UUID, detail: String, retry: Bool = false) {
+        let shouldRetry = retry && settings[id]?.enabled == true
         settings[id]?.active = nil
-        change(id) { $0.isRunning = false; $0.runningUntil = nil; $0.idleSince = nil; $0.enabled = settings[id]?.enabled ?? false; $0.status = $0.enabled ? "等待重新累计空闲" : "已关闭"; $0.detail = detail }
+        settings[id]?.idleSeconds = shouldRetry ? requiredIdleDuration : 0
+        settings[id]?.retryAfter = shouldRetry ? Date().addingTimeInterval(60) : nil
+        change(id) {
+            $0.isRunning = false; $0.runningUntil = nil; $0.idleSince = nil
+            $0.idleSeconds = settings[id]?.idleSeconds ?? 0
+            $0.enabled = settings[id]?.enabled ?? false
+            $0.status = shouldRetry ? "等待 60 秒后重试" : ($0.enabled ? "等待重新累计空闲" : "已关闭")
+            $0.detail = detail
+        }
         lastSample[id] = nil
         try? saveSettings()
     }
@@ -392,6 +447,18 @@ def added_gpu_pids(rows,existing):
 def owned_workers_present(rows,existing,owned):
     current={uuid:pids for uuid,_,_,pids in rows}
     return current.keys()==existing.keys()==owned.keys() and all(owned[uuid]<=pids and pids<=existing[uuid]|owned[uuid] for uuid,pids in current.items())
+def is_memory_error(error):
+    message=str(error).lower()
+    return 'out of memory' in message or 'cublas_status_alloc_failed' in message
+
+def memory_plan(free_bytes):
+    mib=1024**2
+    reserve=min(512*mib,max(16*mib,int(free_bytes*.05)))
+    workspace=min(128*mib,max(8*mib,int(free_bytes*.10)))
+    matrix_budget=max(0,free_bytes-reserve-workspace)
+    sizes=(8192,6144,4096,3072,2048,1536,1024,768,512,256,128)
+    side=next((size for size in sizes if 6*size*size<=matrix_budget),None)
+    return side,reserve
 def terminate_owned(state):
     workers=state.get('workers',[])
     for w in workers:
@@ -428,41 +495,77 @@ if mode=='--watchdog':
         if ident(w['pid'],w['start'],'--worker'):
             try:os.kill(w['pid'],signal.SIGKILL)
             except ProcessLookupError:pass
-    if state.get('token')==token:
+    if state.get('token')==token and state.get('status') in ('starting','running'):
         state['status']='finished';state['detail']='远端 5 分钟看门狗期限已到，已清理 GPUCheck 负载。'
         try:write(statepath,state)
         except Exception:pass
     sys.exit(0)
 if mode=='--worker':
-    device=int(sys.argv[5]);ready=sys.argv[6]
+    device_index=int(sys.argv[5]);ready=sys.argv[6]
+    device=0 if os.environ.get('GPUCHECK_SINGLE_DEVICE')=='1' else device_index
     try:
         if cancelled():raise RuntimeError('Task was cancelled before allocation')
+        os.environ['CUDA_MODULE_LOADING']='LAZY'
         import torch
         torch.set_num_threads(1);torch.cuda.set_device(device)
-        prop=torch.cuda.get_device_properties(device)
-        reserve=max(1024**3,int(prop.total_memory*.03))
-        if cancelled() or time.monotonic()>=deadline:raise RuntimeError('Cancelled or deadline reached before allocation')
-        n=8192 if prop.total_memory>=8*1024**3 else 4096
-        a=torch.randn((n,n),device='cuda',dtype=torch.float16)
-        b=torch.randn((n,n),device='cuda',dtype=torch.float16)
-        c=torch.empty((n,n),device='cuda',dtype=torch.float16)
-        torch.mm(a,b,out=c);torch.cuda.synchronize()
-        free,total=torch.cuda.mem_get_info(device)
-        fill=max(0,min(int(free*.97),free-reserve)-64*1024**2)
-        padding=None
-        for attempt in range(4):
-            if cancelled() or time.monotonic()>=deadline:raise RuntimeError('Cancelled or deadline reached during allocation')
+        # Load the small GEMM/runtime modules before measuring the allocatable budget.
+        warm_a=torch.ones((128,128),device='cuda',dtype=torch.float16)
+        warm_b=torch.ones_like(warm_a)
+        warm_c=torch.mm(warm_a,warm_b);torch.cuda.synchronize()
+        del warm_a,warm_b,warm_c
+        torch.cuda.empty_cache()
+        free_before,total=torch.cuda.mem_get_info(device)
+        side,reserve=memory_plan(free_before)
+        if side is None:raise RuntimeError('当前可用显存不足，稍后将自动重试。')
+        a=b=c=None
+        for n in (size for size in (8192,6144,4096,3072,2048,1536,1024,768,512,256,128) if size<=side):
+            if cancelled() or time.monotonic()>=deadline:raise RuntimeError('Cancelled or deadline reached before allocation')
             try:
-                padding=torch.empty((fill,),device='cuda',dtype=torch.uint8);padding.fill_(1);break
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache();fill=max(0,fill-512*1024**2)
-        if padding is None:raise RuntimeError('Unable to reserve safe VRAM load')
-        torch.cuda.synchronize()
-        free_after,total=torch.cuda.mem_get_info(device)
-        if free_after<reserve:raise RuntimeError('VRAM safety reserve unavailable')
-        write(ready,{'ok':True,'pid':os.getpid(),'start':ticks(os.getpid()),'device':device})
+                a=torch.randn((n,n),device='cuda',dtype=torch.float16)
+                b=torch.randn((n,n),device='cuda',dtype=torch.float16)
+                c=torch.empty((n,n),device='cuda',dtype=torch.float16)
+                torch.mm(a,b,out=c);torch.cuda.synchronize()
+                break
+            except RuntimeError as error:
+                if not is_memory_error(error):raise
+                a=b=c=None
+                torch.cuda.empty_cache()
+        if a is None:raise RuntimeError('当前可用显存无法容纳最小计算矩阵，稍后将自动重试。')
+        padding=[]
+        extra_headroom=min(64*1024**2,max(4*1024**2,int(free_before*.02)))
+        headroom=reserve+extra_headroom
         while time.monotonic()<deadline and not cancelled():
-            torch.mm(a,b,out=c);torch.cuda.synchronize()
+            free,total=torch.cuda.mem_get_info(device)
+            block_size=min(128*1024**2,max(0,free-headroom))
+            if block_size<4*1024**2:break
+            try:
+                block=torch.empty((block_size,),device='cuda',dtype=torch.uint8)
+                block.fill_(1);torch.cuda.synchronize()
+                padding.append(block);del block
+            except RuntimeError as error:
+                if not is_memory_error(error):raise
+                block=None
+                torch.cuda.empty_cache();break
+        free_after,total=torch.cuda.mem_get_info(device)
+        while free_after<reserve and padding:
+            padding.pop();torch.cuda.empty_cache()
+            free_after,total=torch.cuda.mem_get_info(device)
+        if free_after<reserve:
+            a=b=c=None
+            padding.clear();torch.cuda.empty_cache()
+            raise RuntimeError('可用显存发生变化，已释放本轮分配，稍后将自动重试。')
+        write(ready,{'ok':True,'pid':os.getpid(),'start':ticks(os.getpid()),'device':device_index,'matrixSide':n,'freeBeforeMiB':free_before//1024**2,'freeAfterMiB':free_after//1024**2,'paddingMiB':sum(block.numel() for block in padding)//1024**2})
+        batch_count=max(8,min(256,8192//n*8))
+        last_pressure_check=time.monotonic()
+        while time.monotonic()<deadline and not cancelled():
+            for _ in range(batch_count):torch.mm(a,b,out=c)
+            torch.cuda.synchronize()
+            if time.monotonic()-last_pressure_check>=2:
+                free,total=torch.cuda.mem_get_info(device)
+                while free<reserve and padding:
+                    padding.pop();torch.cuda.empty_cache()
+                    free,total=torch.cuda.mem_get_info(device)
+                last_pressure_check=time.monotonic()
     except Exception as e:
         write(ready,{'ok':False,'detail':str(e)})
         sys.exit(2)
@@ -494,19 +597,21 @@ try:
     for index in range(len(rows)):
         if interrupted or cancelled() or time.monotonic()>=deadline:raise RuntimeError('任务已停止或期限已到。')
         ready=statepath+'.ready.'+str(index)
-        proc=subprocess.Popen([sys.executable,__file__,'--worker',token,statepath,str(deadline),str(index),ready],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        worker_env=dict(os.environ,CUDA_VISIBLE_DEVICES=rows[index][0],GPUCHECK_SINGLE_DEVICE='1',CUDA_MODULE_LOADING='LAZY')
+        proc=subprocess.Popen([sys.executable,__file__,'--worker',token,statepath,str(deadline),str(index),ready],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=worker_env)
         children.append((proc,ready))
         state['workers'].append({'pid':proc.pid,'start':ticks(proc.pid)})
         write(statepath,state)
     prepare_until=min(deadline,time.monotonic()+45)
     while True:
         if interrupted or cancelled() or time.monotonic()>=prepare_until:raise RuntimeError('负载准备超时或已被停止。')
-        if any(proc.poll() is not None for proc,_ in children):raise RuntimeError('GPU worker 提前退出，本轮取消。')
         ready_values=[]
         for proc,path in children:
             if os.path.exists(path):
                 with open(path) as f:ready_values.append(json.load(f))
-        if any(not r.get('ok') for r in ready_values):raise RuntimeError('部分 GPU 无法安全分配显存，本轮取消。')
+        failed=[r.get('detail','Unknown worker error') for r in ready_values if not r.get('ok')]
+        if failed:raise RuntimeError('GPU 负载启动失败：'+'; '.join(failed))
+        if any(proc.poll() is not None for proc,_ in children):raise RuntimeError('GPU worker 提前退出，本轮取消。')
         current=gpu_state()
         added=added_gpu_pids(current,existing)
         if any(len(pids)>1 for pids in added.values()):raise RuntimeError('发现新加入的外部 NVIDIA 进程，已停止本轮负载。')
@@ -515,7 +620,7 @@ try:
             if len(set().union(*added.values()))!=len(children):raise RuntimeError('GPU 进程归属存在歧义，本轮取消。')
             owned=added;break
         time.sleep(.2)
-    state['status']='running';state['detail']='全卡计算与显存负载运行中；发现新计算进程将提前退出。';write(statepath,state)
+    state['status']='running';state['workerMetrics']=ready_values;state['detail']='已按各卡可用显存调整矩阵和填充，全卡计算负载运行中。';write(statepath,state)
     while time.monotonic()<deadline and not interrupted and not cancelled():
         if any(proc.poll() is not None for proc,_ in children):raise RuntimeError('GPU worker 已退出，结束本轮。')
         current=gpu_state()

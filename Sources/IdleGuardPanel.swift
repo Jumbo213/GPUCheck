@@ -33,9 +33,9 @@ struct IdleGuardPanel: View {
                 .controlSize(.small)
                 .tint(Color.accent)
                 .disabled(busy)
-                .help("仅在这台服务器的全部 GPU 连续空闲 5 小时后自动运行")
+                .help("仅在这台服务器的全部 GPU 在线空闲累计 5 小时后自动运行")
             }
-            Text("全部 GPU 连续空闲 5 小时后，以高负载运行 5 分钟。接近满显存，保留少量运行空间。")
+            Text("全部 GPU 在线空闲累计 5 小时后，以高负载运行 5 分钟。按各卡可用显存调整矩阵和填充大小。")
                 .font(.system(size: 12)).foregroundStyle(Color.muted).lineSpacing(4)
             HStack(alignment: .top, spacing: 9) {
                 Circle().fill(statusColor).frame(width: 6, height: 6).padding(.top, 4)
@@ -54,9 +54,11 @@ struct IdleGuardPanel: View {
                     } else if let since = state?.idleSince, enabled {
                         TimelineView(.periodic(from: .now, by: 1)) { context in
                             let elapsed = max(0, context.date.timeIntervalSince(since))
-                            Text("已连续空闲 \(duration(elapsed)) · 距离启动 \(duration(max(0, 5 * 3600 - elapsed)))")
+                            Text("已累计在线空闲 \(duration(elapsed)) · 距离启动 \(duration(max(0, 5 * 3600 - elapsed)))")
                                 .font(.system(size: 10, design: .monospaced)).foregroundStyle(Color.muted).monospacedDigit()
                         }
+                    } else if enabled && (state?.idleSeconds ?? 0) > 0 {
+                        Text("已累计在线空闲 \(duration(state?.idleSeconds ?? 0))，恢复采样后继续").font(.system(size: 10)).foregroundStyle(Color.muted)
                     }
                 }
                 Spacer(minLength: 10)
@@ -71,7 +73,7 @@ struct IdleGuardPanel: View {
                 .background(Color.canvas, in: RoundedRectangle(cornerRadius: 10))
             HStack(alignment: .top, spacing: 6) {
                 Image(systemName: "info.circle").padding(.top, 1)
-                Text("空闲条件：全部 GPU 利用率连续 5 小时 ≤2%；不检查显存占用或已有进程。应用需持续运行；维护按可用显存分配，并保留运行余量。")
+                Text("空闲条件：全部 GPU 利用率 ≤2% 的在线时间累计 5 小时；不检查显存占用或已有进程。断连与休眠暂停计时，重连继续；短暂小负载暂停计时；高于 2% 持续 15 秒或达到 10% 时清零。显存不足时 60 秒后重试。")
                     .lineSpacing(3)
             }.font(.system(size: 10)).foregroundStyle(Color.muted)
             if let error {

@@ -135,3 +135,21 @@ assert "if cancelled():raise RuntimeError('本轮启动已被取消。')" in sou
 assert 'while time.monotonic()<deadline and not cancelled()' in source
 assert "if ident(pid,ticks,'--runner')" in control
 print('LAUNCH_300_SECOND_BOUND_DURABLE_CANCEL_AND_SCOPED_STOP_GUARDS_OK')
+
+# An 80 GiB card may have very little free memory. Plan against free bytes.
+last_side=0
+for free_mib in (32, 64, 128, 256, 320, 768, 4096, 32768):
+    free=free_mib*1024**2
+    side,reserve=namespace['memory_plan'](free)
+    assert side is not None and 6*side*side+reserve<=free
+    assert reserve<=512*1024**2
+    assert side>=last_side
+    last_side=side
+assert namespace['memory_plan'](8*1024**2)[0] is None
+assert namespace['memory_plan'](320*1024**2)[0]<8192
+print('ADAPTIVE_MATRICES_AND_RESERVE_FOR_32MIB_TO_32GIB_FREE_VRAM_OK')
+
+assert namespace['is_memory_error'](RuntimeError('CUDA error: out of memory'))
+assert namespace['is_memory_error'](RuntimeError('CUBLAS_STATUS_ALLOC_FAILED'))
+assert not namespace['is_memory_error'](RuntimeError('CUDA illegal memory access'))
+print('CUDA_RUNTIME_MEMORY_ERRORS_CLASSIFIED_WITHOUT_SWALLOWING_OTHER_FAILURES_OK')
