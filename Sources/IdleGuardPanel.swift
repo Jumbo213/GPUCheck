@@ -31,9 +31,9 @@ struct IdleGuardPanel: View {
                 .font(.system(size: 11, weight: .medium))
                 .toggleStyle(.switch).controlSize(.small).tint(Color.accent)
                 .disabled(busy)
-                .help("每张 GPU 最近 5 小时有效采样的平均利用率均低于 20% 时自动运行")
+                .help("全部 GPU 的实时利用率连续 5 小时均低于 20% 才自动运行")
             }
-            Text("每张 GPU 的 5 小时平均利用率均低于 20% 时，自动高负载运行 5 分钟。也可手动立即开始，按各卡可用显存调整负载。")
+            Text("全部 GPU 的实时利用率连续 5 小时均低于 20% 时，自动高负载运行 5 分钟。任意一张达到 20% 即重新计时。也可手动立即开始。")
                 .font(.system(size: 12)).foregroundStyle(Color.muted).lineSpacing(4)
             HStack(spacing: 10) {
                 Button {
@@ -67,10 +67,10 @@ struct IdleGuardPanel: View {
                                 .font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(Color.orange).monospacedDigit()
                         }
                     } else if enabled || (state?.idleSeconds ?? 0) > 0 {
-                        Text("有效采样 \(duration(state?.idleSeconds ?? 0)) / 5 小时")
+                        Text("连续低于 20% \(duration(state?.idleSeconds ?? 0)) / 5 小时")
                             .font(.system(size: 10, design: .monospaced)).foregroundStyle(Color.muted)
-                        if let peak = state?.averageLoads.max() {
-                            Text(String(format: "各卡平均利用率最高 %.1f%% · 触发条件 <20%%", peak))
+                        if let peak = state?.currentLoads.max() {
+                            Text(String(format: "当前单卡最高利用率 %.1f%% · 各卡均需 <20%%", peak))
                                 .font(.system(size: 10, design: .monospaced)).foregroundStyle(Color.muted)
                         }
                     }
@@ -80,7 +80,7 @@ struct IdleGuardPanel: View {
                 .background(Color.canvas, in: RoundedRectangle(cornerRadius: 10))
             HStack(alignment: .top, spacing: 6) {
                 Image(systemName: "info.circle").padding(.top, 1)
-                Text("自动判定采用最近 5 小时有效在线数据的时间加权平均，不检查显存占用。短时高负载计入平均值；断连与休眠暂停采样，重连继续。每次维护最长 5 分钟；自动模式显存不足时 60 秒后重试。升级后从新窗口开始采样。")
+                Text("每 5 秒逐卡检查实时利用率，不检查显存占用。任何一张达到或超过 20%，或断连、休眠、读数缺失，都会重新计时。自动启动前再次检查全部 GPU。维护按可用显存调整负载，每次最长 5 分钟；自动模式资源不足时 60 秒后复查，仍满足连续空闲条件才重试。")
                     .lineSpacing(3)
             }.font(.system(size: 10)).foregroundStyle(Color.muted)
             if let error {
@@ -124,8 +124,9 @@ struct IdleGuardPanel: View {
         let seconds = max(0, Int(interval.rounded(.down)))
         let hours = seconds / 3600
         let minutes = (seconds % 3600) / 60
-        if hours > 0 { return "\(hours) 小时 \(minutes) 分钟" }
-        return "\(minutes) 分钟"
+        if hours > 0 { return "\(hours) 小时 \(minutes) 分 \(seconds % 60) 秒" }
+        if minutes > 0 { return "\(minutes) 分 \(seconds % 60) 秒" }
+        return "\(seconds) 秒"
     }
 
     private func countdown(_ interval: TimeInterval) -> String {

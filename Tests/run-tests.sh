@@ -8,7 +8,7 @@ xcrun swiftc -swift-version 5 -parse-as-library \
   "$project_dir/Sources/Models.swift" \
   "$project_dir/Sources/SSHClient.swift" \
   "$project_dir/Sources/MonitorStore.swift" \
-  "$project_dir/Sources/MaintenanceWindow.swift" \
+  "$project_dir/Sources/ContinuousIdleTimer.swift" \
   "$project_dir/Sources/IdleGuard.swift" \
   "$project_dir/Tests/IdleGuardSmoke.swift" \
   -lsqlite3 -framework Security -o "$test_dir/idle-smoke"
@@ -20,7 +20,7 @@ xcrun swiftc -swift-version 5 -parse-as-library \
   "$project_dir/Sources/Models.swift" \
   "$project_dir/Sources/SSHClient.swift" \
   "$project_dir/Sources/MonitorStore.swift" \
-  "$project_dir/Sources/MaintenanceWindow.swift" \
+  "$project_dir/Sources/ContinuousIdleTimer.swift" \
   "$project_dir/Sources/IdleGuard.swift" \
   "$project_dir/Tests/HistoryRecoverySmoke.swift" \
   -lsqlite3 -framework Security -o "$test_dir/history-smoke"

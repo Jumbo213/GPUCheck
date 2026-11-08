@@ -11,7 +11,7 @@ import re
 import xml.etree.ElementTree as ET
 
 folder = pathlib.Path(sys.argv[1])
-for filename in ('runner.py', 'control.py', 'launch.py', 'preflight.py'):
+for filename in ('runner.py', 'control.py', 'launch.py', 'launch-auto.py', 'preflight.py'):
     ast.parse((folder / filename).read_text(), filename=filename)
 print('ALL_GENERATED_PYTHON_AST_OK')
 source = (folder / 'runner.py').read_text()
@@ -86,19 +86,30 @@ launch_functions = [n for n in launch_tree.body if isinstance(n, ast.FunctionDef
 exec(compile(ast.fix_missing_locations(ast.Module(body=launch_functions, type_ignores=[])), 'launcher-functions', 'exec'), launch_namespace)
 def xml_data(load_a='0 %', load_b='2 %', memory='79000 MiB'):
     return f'<nvidia_smi_log><gpu><uuid>GPU-a</uuid><utilization><gpu_util>{load_a}</gpu_util></utilization><fb_memory_usage><used>{memory}</used></fb_memory_usage><processes><process_info><pid>900</pid><type>C</type></process_info></processes></gpu><gpu><uuid>GPU-b</uuid><utilization><gpu_util>{load_b}</gpu_util></utilization><processes><process_info><pid>900</pid></process_info><process_info><pid>901</pid></process_info></processes></gpu></nvidia_smi_log>'.encode()
-# The local rolling mean decides automatic eligibility; manual launch must also
-# work while current utilization is high or unavailable.
+# Manual mode ignores instantaneous load, while automatic mode must confirm
+# every card below 20% immediately before launch and before worker allocation.
 for payload in [xml_data(), xml_data(memory='N/A'), xml_data(load_a='100 %'), xml_data(load_b='N/A')]:
     launch_namespace['subprocess'] = types.SimpleNamespace(check_output=lambda *a, _data=payload, **k: _data)
     assert launch_namespace['devices_now']() == ['GPU-a', 'GPU-b']
-launch_namespace['subprocess'] = types.SimpleNamespace(check_output=lambda *a, **k: b'<nvidia_smi_log/>')
-try:
-    launch_namespace['devices_now']()
-    raise AssertionError('No GPU must reject')
-except RuntimeError:
-    pass
-assert 'initially_idle' not in source and 'idle_now' not in launch_source
-print('LAUNCHER_MANUAL_AND_AVERAGE_POLICY_WITHOUT_INSTANTANEOUS_GATE_OK')
+for payload in [xml_data(load_a='19.9 %'), xml_data(memory='N/A')]:
+    launch_namespace['subprocess'] = types.SimpleNamespace(check_output=lambda *a, _data=payload, **k: _data)
+    assert launch_namespace['devices_now'](True) == ['GPU-a', 'GPU-b']
+for payload in [xml_data(load_a='20 %'), xml_data(load_b='21 %'), xml_data(load_b='N/A'), xml_data(load_b='-1 %'), b'<nvidia_smi_log/>']:
+    launch_namespace['subprocess'] = types.SimpleNamespace(check_output=lambda *a, _data=payload, **k: _data)
+    try:
+        launch_namespace['devices_now'](True)
+        raise AssertionError('Any busy or unknown card must reject automatic launch')
+    except RuntimeError:
+        pass
+rows = [('GPU-a', 0, 79000, {900}), ('GPU-b', 19.9, None, {901})]
+assert namespace['all_cards_below_threshold'](rows)
+for load in (20, 21, 100, None, -1, float('nan')):
+    assert not namespace['all_cards_below_threshold']([rows[0], ('GPU-b', load, None, set())])
+automatic_source = (folder/'launch-auto.py').read_text()
+assert 'automatic=True' in automatic_source and 'automatic=False' in launch_source
+assert launch_source.count('devices=devices_now(automatic)') == 2
+assert source.count("os.environ.get('GPUCHECK_AUTOMATIC')=='1' and not all_cards_below_threshold(rows)") == 2
+print('REMOTE_AUTOMATIC_REALTIME_SINGLE_CARD_RECHECK_AND_MANUAL_BYPASS_OK')
 
 # Run only the watchdog AST branch with mocked time/process files/signals.
 # No subprocesses, CUDA, filesystem writes, sleeps, or real os.kill calls occur.
