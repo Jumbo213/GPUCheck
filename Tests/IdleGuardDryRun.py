@@ -58,13 +58,6 @@ assert not namespace['ident'](701, '11', '--runner')
 assert namespace['discover_workers']() == [{'pid': 701, 'start': '11'}]
 print('TOKEN_PID_STARTTIME_NAMESPACE_GROUP_VALIDATION_OK')
 
-# Busy memory and already-running idle programs do not block eligibility.
-rows = [('GPU-a', 0, 79000, {900, 901}), ('GPU-b', 2, None, {900})]
-assert namespace['initially_idle'](rows)
-for bad in [[], [('GPU-a', None, 100, set())], [('GPU-a', 2.1, 79000, {900})], [('GPU-a', -1, None, set())], [('GPU-a', float('nan'), None, set())]]:
-    assert not namespace['initially_idle'](bad)
-print('REMOTE_UTILIZATION_ONLY_IGNORES_VRAM_AND_EXISTING_PROCESSES_OK')
-
 existing = {'GPU-a': {900, 901}, 'GPU-b': {900}}
 current = [('GPU-a', 100, 81000, {900, 901, 800}), ('GPU-b', 100, 81000, {900, 801})]
 owned = namespace['added_gpu_pids'](current, existing)
@@ -93,17 +86,19 @@ launch_functions = [n for n in launch_tree.body if isinstance(n, ast.FunctionDef
 exec(compile(ast.fix_missing_locations(ast.Module(body=launch_functions, type_ignores=[])), 'launcher-functions', 'exec'), launch_namespace)
 def xml_data(load_a='0 %', load_b='2 %', memory='79000 MiB'):
     return f'<nvidia_smi_log><gpu><uuid>GPU-a</uuid><utilization><gpu_util>{load_a}</gpu_util></utilization><fb_memory_usage><used>{memory}</used></fb_memory_usage><processes><process_info><pid>900</pid><type>C</type></process_info></processes></gpu><gpu><uuid>GPU-b</uuid><utilization><gpu_util>{load_b}</gpu_util></utilization><processes><process_info><pid>900</pid></process_info><process_info><pid>901</pid></process_info></processes></gpu></nvidia_smi_log>'.encode()
-for payload in [xml_data(), xml_data(memory='N/A')]:
+# The local rolling mean decides automatic eligibility; manual launch must also
+# work while current utilization is high or unavailable.
+for payload in [xml_data(), xml_data(memory='N/A'), xml_data(load_a='100 %'), xml_data(load_b='N/A')]:
     launch_namespace['subprocess'] = types.SimpleNamespace(check_output=lambda *a, _data=payload, **k: _data)
-    assert launch_namespace['idle_now']() == ['GPU-a', 'GPU-b']
-for payload in [xml_data(load_a='3 %'), xml_data(load_b='N/A')]:
-    launch_namespace['subprocess'] = types.SimpleNamespace(check_output=lambda *a, _data=payload, **k: _data)
-    try:
-        launch_namespace['idle_now']()
-        raise AssertionError('Busy or unknown utilization must reject')
-    except RuntimeError:
-        pass
-print('LAUNCHER_XML_HIGH_VRAM_EXISTING_PID_AND_UNKNOWN_VRAM_REGRESSION_OK')
+    assert launch_namespace['devices_now']() == ['GPU-a', 'GPU-b']
+launch_namespace['subprocess'] = types.SimpleNamespace(check_output=lambda *a, **k: b'<nvidia_smi_log/>')
+try:
+    launch_namespace['devices_now']()
+    raise AssertionError('No GPU must reject')
+except RuntimeError:
+    pass
+assert 'initially_idle' not in source and 'idle_now' not in launch_source
+print('LAUNCHER_MANUAL_AND_AVERAGE_POLICY_WITHOUT_INSTANTANEOUS_GATE_OK')
 
 # Run only the watchdog AST branch with mocked time/process files/signals.
 # No subprocesses, CUDA, filesystem writes, sleeps, or real os.kill calls occur.

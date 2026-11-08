@@ -4,25 +4,29 @@ import Combine
 struct IdleGuardState {
     var enabled = false
     var status = "未启用"
-    var detail = "可选功能：连续观察全部 GPU 空闲 5 小时后，运行最多 5 分钟的显存与计算负载。"
+    var detail = "自动模式按每张 GPU 最近 5 小时有效采样的平均利用率判断。"
     var idleSeconds: TimeInterval = 0
-    var idleSince: Date?
+    var averageLoads: [Double] = []
     var runningUntil: Date?
     var busy = false
     var isRunning = false
+    var stopping = false
 }
 
 private struct IdleGuardRun: Codable {
     var token: String
     var server: Server
     var deadline: Date
+    var manual: Bool?
 }
+
 private struct IdleGuardSetting: Codable {
     var enabled = false
-    var idleSeconds: TimeInterval?
+    var window: MaintenanceWindow?
     var retryAfter: Date?
     var active: IdleGuardRun?
 }
+
 private struct IdleGuardRemoteReply: Decodable {
     var ok: Bool
     var status: String?
@@ -32,36 +36,49 @@ private struct IdleGuardRemoteReply: Decodable {
 
 @MainActor
 final class IdleGuardManager: ObservableObject {
+    typealias Transport = @Sendable (Server, String, TimeInterval) async throws -> Data
     static let idleDuration: TimeInterval = 5 * 3600
     @Published var states: [UUID: IdleGuardState] = [:]
     private weak var store: MonitorStore?
-    private let client = SSHClient()
+    private let transport: Transport
     private let settingsURL: URL
+    private let requiredIdleDuration: TimeInterval
     private var settings: [UUID: IdleGuardSetting] = [:]
     private var pollTask: Task<Void, Never>?
-    private let requiredIdleDuration: TimeInterval
+    private var launching: Set<UUID> = []
+    private var stopping: Set<UUID> = []
     private var lastProgressSave = Date.distantPast
     private var previousTick: Date?
-    private var busySince: [UUID: Date] = [:]
     private var lastSample: [UUID: Date] = [:]
 
-    init(store: MonitorStore, settingsURL: URL? = nil, idleDuration: TimeInterval = 5 * 3600) {
+    init(store: MonitorStore, settingsURL: URL? = nil, idleDuration: TimeInterval = 5 * 3600, transport: Transport? = nil) {
         self.store = store
         self.settingsURL = settingsURL ?? SSHClient.applicationDirectory.appendingPathComponent("idle-guard.json")
         requiredIdleDuration = idleDuration
-        if let data = try? Data(contentsOf: self.settingsURL), let saved = try? JSONDecoder().decode([UUID: IdleGuardSetting].self, from: data) { settings = saved }
+        self.transport = transport ?? { server, script, timeout in
+            try await SSHClient().run(server, script: script, timeout: timeout)
+        }
+        if let data = try? Data(contentsOf: self.settingsURL), let saved = try? JSONDecoder().decode([UUID: IdleGuardSetting].self, from: data) {
+            settings = saved
+        }
         for server in store.servers {
             let setting = settings[server.id] ?? IdleGuardSetting()
-            var state = IdleGuardState(); state.enabled = setting.enabled; state.idleSeconds = max(0, setting.idleSeconds ?? 0)
+            var state = IdleGuardState()
+            state.enabled = setting.enabled
+            state.idleSeconds = setting.window?.duration ?? 0
+            state.averageLoads = setting.window?.averages ?? []
             if let active = setting.active {
-                state.isRunning = true; state.runningUntil = active.deadline; state.status = "正在核对远端任务"
-                state.detail = "上次任务由远端独立看门狗限制为最多 5 分钟。"
+                state.isRunning = true
+                state.runningUntil = active.deadline
+                state.status = "正在核对远端任务"
             } else if setting.enabled {
-                state.status = "等待新采样"; state.detail = "继续累计已保存的在线空闲时间。"
+                state.status = "等待有效采样"
+                state.detail = "按每张卡的时间加权平均值判定，采满 5 小时后各卡均低于 20% 时触发。"
             }
             states[server.id] = state
         }
     }
+
     deinit { pollTask?.cancel() }
 
     func start() {
@@ -69,148 +86,138 @@ final class IdleGuardManager: ObservableObject {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard self != nil else { return }
-                await self?.tick()
+                await self?.refresh()
                 do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
             }
         }
     }
 
     func setEnabled(_ enabled: Bool, for server: Server) async throws {
-        guard !(states[server.id]?.busy ?? false) else { throw GPUCheckError("正在处理此服务器的空闲保活设置，请稍候。") }
+        guard !(states[server.id]?.busy ?? false) else { throw GPUCheckError("正在处理此服务器，请稍候。") }
         if !enabled {
-            var setting = settings[server.id] ?? IdleGuardSetting(); setting.enabled = false; settings[server.id] = setting
-            change(server.id) { $0.enabled = false; $0.idleSince = nil; $0.status = "已关闭"; $0.detail = "不会再启动新的负载。" }
+            settings[server.id, default: IdleGuardSetting()].enabled = false
+            change(server.id) {
+                $0.enabled = false
+                if !$0.isRunning { $0.status = "自动运行已关闭" }
+            }
             try saveSettings()
-            if setting.active != nil { try await stop(for: server) }
+            if let active = settings[server.id]?.active, active.manual != true { try await stop(for: server) }
             return
         }
-        let previousSetting = settings[server.id]
-        let previouslyEnabled = states[server.id]?.enabled ?? false
+        let previous = settings[server.id]
         change(server.id) { $0.busy = true; $0.status = "正在检查运行环境" }
-        defer { change(server.id) { $0.busy = false } }
+        defer { refreshBusy(server.id) }
         do {
             let reply = try await request(server, script: Self.preflightScript, timeout: 30)
             guard reply.ok else { throw GPUCheckError(reply.detail ?? "远端环境检查失败。") }
-            var setting = settings[server.id] ?? IdleGuardSetting(); setting.enabled = true; settings[server.id] = setting
+            settings[server.id, default: IdleGuardSetting()].enabled = true
             try saveSettings()
             change(server.id) {
-                $0.enabled = true; $0.idleSince = nil; $0.status = "等待连续空闲"
-                $0.detail = "环境检查通过；全部 GPU 连续空闲 5 小时才会触发。断连或休眠暂停累计，检测到 GPU 忙碌时重新计时。"
+                $0.enabled = true
+                if !$0.isRunning { $0.status = "正在观察 5 小时平均利用率" }
             }
             lastSample[server.id] = nil
         } catch {
-            settings[server.id] = previousSetting
-            try? saveSettings()
-            change(server.id) { $0.enabled = previouslyEnabled; $0.status = "启用失败"; $0.detail = error.localizedDescription }
+            settings[server.id] = previous
+            change(server.id) { $0.enabled = previous?.enabled ?? false; $0.status = "启用失败"; $0.detail = error.localizedDescription }
             throw error
         }
+    }
+
+    func startNow(for server: Server) async throws {
+        guard settings[server.id]?.active == nil, !(states[server.id]?.busy ?? false) else {
+            throw GPUCheckError("此服务器已有维护任务正在准备或运行。")
+        }
+        try await launch(for: server, manual: true)
     }
 
     func stop(for server: Server) async throws {
-        guard !(states[server.id]?.busy ?? false) else { throw GPUCheckError("正在处理此服务器的任务，请稍候。") }
-        guard let run = settings[server.id]?.active else {
-            change(server.id) { $0.isRunning = false; $0.runningUntil = nil; $0.idleSince = nil }
-            return
-        }
-        change(server.id) { $0.busy = true; $0.status = "正在停止远端负载" }
-        defer { change(server.id) { $0.busy = false } }
+        guard !stopping.contains(server.id) else { return }
+        guard let run = settings[server.id]?.active else { return }
+        stopping.insert(server.id)
+        change(server.id) { $0.busy = true; $0.stopping = true; $0.status = "正在结束维护" }
+        defer { stopping.remove(server.id); refreshBusy(server.id) }
         do {
             let reply = try await request(run.server, script: Self.controlScript(token: run.token, stop: true), timeout: 18)
-            guard reply.ok else { throw GPUCheckError(reply.detail ?? "无法确认远端任务已停止。") }
-            finish(server.id, detail: reply.detail ?? "已停止 GPUCheck 自己启动的负载。")
+            guard reply.ok else { throw GPUCheckError(reply.detail ?? "无法确认任务已结束。") }
+            guard settings[server.id]?.active?.token == run.token else { return }
+            finish(server.id, detail: "已结束维护。")
         } catch {
-            change(server.id) { $0.status = "停止尚未确认"; $0.detail = "\(error.localizedDescription) 远端独立看门狗仍会在原定 5 分钟期限内结束任务。" }
+            change(server.id) { $0.status = "停止尚未确认"; $0.detail = "\(error.localizedDescription) 远端仍受 5 分钟期限约束。" }
             throw error
         }
     }
 
-    static func isIdle(_ snapshot: Snapshot) -> Bool {
-        guard !snapshot.gpus.isEmpty else { return false }
-        return snapshot.gpus.allSatisfy { gpu in
-            guard let load = gpu.utilization else { return false }
-            return load.isFinite && load >= 0 && load <= 2
-        }
-    }
-
-    static func thresholdReached(idleSince: Date?, now: Date) -> Bool {
-        guard let idleSince, now >= idleSince else { return false }
-        return now.timeIntervalSince(idleSince) >= idleDuration
-    }
-
-    private func tick() async {
+    func refresh(now: Date = Date()) async {
         guard let store else { return }
-        let now = Date()
         let interrupted = previousTick.map { now.timeIntervalSince($0) > 20 || now.timeIntervalSince($0) < 0 } ?? false
         previousTick = now
         let servers = store.servers
-        // Recover/stop owned tasks even if their server entry was removed or edited.
         let activeIDs = settings.keys.filter { settings[$0]?.active != nil }
         for id in activeIDs where !(states[id]?.busy ?? false) {
             guard let run = settings[id]?.active else { continue }
             do {
-                let shouldStop = !(settings[id]?.enabled ?? false) || !servers.contains { $0.id == id && $0 == run.server }
+                let shouldStop = (run.manual != true && settings[id]?.enabled != true) || !servers.contains(run.server)
                 let reply = try await request(run.server, script: Self.controlScript(token: run.token, stop: shouldStop), timeout: 18)
-                guard settings[id]?.active?.token == run.token else { continue }
+                guard settings[id]?.active?.token == run.token, !stopping.contains(id) else { continue }
                 guard reply.ok else { throw GPUCheckError(reply.detail ?? "无法确认远端任务状态。") }
                 if reply.status == "running" || reply.status == "starting" {
-                    change(id) { $0.isRunning = true; $0.idleSince = nil; $0.runningUntil = Date().addingTimeInterval(max(0, reply.remaining ?? 0)); $0.status = reply.status == "starting" ? "正在准备负载" : "正在运行 5 分钟负载"; $0.detail = reply.detail ?? "远端看门狗独立计时；发现外部计算进程会提前结束。" }
-                } else { finish(id, detail: reply.detail ?? "本轮任务已结束。", retry: reply.status == "cancelled") }
+                    change(id) {
+                        $0.isRunning = true
+                        $0.runningUntil = Date().addingTimeInterval(max(0, reply.remaining ?? 0))
+                        $0.status = reply.status == "starting" ? "正在准备维护" : "GPU 维护运行中"
+                        $0.detail = reply.detail ?? "远端任务最多运行 5 分钟。"
+                    }
+                } else {
+                    finish(id, detail: reply.detail ?? "维护已结束。", retry: reply.status == "cancelled" && run.manual != true)
+                }
             } catch {
-                guard settings[id]?.active?.token == run.token else { continue }
-                change(id) { $0.idleSince = nil; $0.status = "远端任务状态待确认"; $0.detail = "\(error.localizedDescription) 任务有独立 5 分钟期限。" }
+                guard settings[id]?.active?.token == run.token, !stopping.contains(id) else { continue }
+                change(id) { $0.status = "远端任务状态待确认"; $0.detail = error.localizedDescription }
             }
         }
         for server in servers where !activeIDs.contains(server.id) {
             let id = server.id
-            if states[id] == nil { states[id] = IdleGuardState() }
             guard settings[id]?.enabled == true, settings[id]?.active == nil, !(states[id]?.busy ?? false) else { continue }
-            guard !interrupted, store.errors[id] == nil, let snapshot = store.snapshots[id], now.timeIntervalSince(snapshot.timestamp) >= 0, now.timeIntervalSince(snapshot.timestamp) <= 20 else {
-                change(id) { $0.idleSince = nil; $0.status = "计时已暂停，等待连接"; $0.detail = "已累计的在线空闲时间会保留，恢复有效采样后继续。" }
+            guard !interrupted, store.errors[id] == nil, let snapshot = store.snapshots[id],
+                  now.timeIntervalSince(snapshot.timestamp) >= 0, now.timeIntervalSince(snapshot.timestamp) <= 20 else {
                 lastSample[id] = nil
-                busySince[id] = nil
+                change(id) { $0.status = "平均利用率采样已暂停"; $0.detail = "恢复有效连接后继续累计采样时长。" }
                 continue
             }
-            let previous = lastSample[id]
+            let gpus = snapshot.gpus.sorted { $0.index < $1.index }
+            let ids = gpus.map(\.id)
+            let loads = gpus.compactMap(\.utilization)
+            guard !gpus.isEmpty, loads.count == gpus.count, loads.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 100 }) else {
+                lastSample[id] = nil
+                change(id) { $0.status = "利用率读数不可用，暂停采样" }
+                continue
+            }
+            var window = settings[id]?.window ?? MaintenanceWindow()
+            if window.gpuIDs != ids { window = MaintenanceWindow(gpuIDs: ids); lastSample[id] = nil }
+            let seconds = Self.creditedInterval(previous: lastSample[id], current: snapshot.timestamp)
             lastSample[id] = snapshot.timestamp
-            guard Self.isIdle(snapshot) else {
-                lastSample[id] = nil
-                let validLoads = snapshot.gpus.compactMap(\.utilization).filter { $0.isFinite && $0 >= 0 }
-                guard validLoads.count == snapshot.gpus.count else {
-                    busySince[id] = nil
-                    change(id) { $0.idleSince = nil; $0.status = "利用率读数不可用，暂停计时" }
-                    continue
-                }
-                let firstBusy = busySince[id] ?? snapshot.timestamp
-                busySince[id] = firstBusy
-                let sustained = snapshot.timestamp.timeIntervalSince(firstBusy)
-                if Self.shouldResetIdle(peakUtilization: validLoads.max() ?? 0, busySeconds: sustained) {
-                    settings[id]?.idleSeconds = 0
-                    settings[id]?.retryAfter = nil
-                    change(id) { $0.idleSince = nil; $0.idleSeconds = 0; $0.status = "GPU 使用中"; $0.detail = "利用率达到 10%，或连续高于 2% 达 15 秒，重新累计空闲时间。" }
-                } else {
-                    change(id) { $0.idleSince = nil; $0.status = "检测到瞬时负载，暂停计时"; $0.detail = "短暂的小幅波动保留已累计时间，恢复 ≤2% 后继续。" }
-                }
-                continue
+            window.append(gpuIDs: ids, loads: loads, seconds: seconds, limit: requiredIdleDuration)
+            settings[id]?.window = window
+            let averages = window.averages
+            change(id) {
+                $0.idleSeconds = window.duration
+                $0.averageLoads = averages
+                $0.status = "正在观察 5 小时平均利用率"
+                $0.detail = window.duration >= requiredIdleDuration ? "各卡平均值均低于 20% 时自动触发。" : "采满 5 小时有效数据后判定，断连与休眠期间暂停。"
             }
-            busySince[id] = nil
+            guard window.qualifies(requiredDuration: requiredIdleDuration) else { continue }
             if let retryAfter = settings[id]?.retryAfter, retryAfter > now {
-                change(id) { $0.idleSince = nil; $0.status = "等待可用资源后重试" }
+                change(id) { $0.status = "等待可用资源后重试" }
                 continue
             }
-            let credited = Self.creditedInterval(previous: previous, current: snapshot.timestamp)
-            let elapsed = max(0, settings[id]?.idleSeconds ?? 0) + credited
-            settings[id]?.idleSeconds = elapsed
-            change(id) { $0.idleSeconds = elapsed; $0.idleSince = now.addingTimeInterval(-elapsed); $0.status = "正在累计在线空闲时间"; $0.detail = "累计满 5 小时触发；断连或休眠暂停计时，持续高于 2% 达 15 秒或达到 10% 时清零。" }
-            if elapsed >= requiredIdleDuration { await launch(for: server) }
+            do { try await launch(for: server, manual: false) }
+            catch { /* The launch stores its scoped recovery state and error for the UI. */ }
         }
-        if now.timeIntervalSince(lastProgressSave) >= 15 {
+        if now.timeIntervalSince(lastProgressSave) >= 60 {
             do { try saveSettings(); lastProgressSave = now }
-            catch { for server in servers { change(server.id) { $0.detail = "计时保存失败：\(error.localizedDescription)" } } }
+            catch { for server in servers { change(server.id) { $0.detail = "采样窗口保存失败：\(error.localizedDescription)" } } }
         }
-    }
-
-    static func shouldResetIdle(peakUtilization: Double, busySeconds: TimeInterval) -> Bool {
-        peakUtilization >= 10 || busySeconds >= 15
     }
 
     static func creditedInterval(previous: Date?, current: Date) -> TimeInterval {
@@ -219,62 +226,78 @@ final class IdleGuardManager: ObservableObject {
         return seconds >= 0 && seconds <= 20 ? seconds : 0
     }
 
-    private func launch(for server: Server) async {
+    private func launch(for server: Server, manual: Bool) async throws {
+        guard settings[server.id]?.active == nil, !launching.contains(server.id), !stopping.contains(server.id) else {
+            throw GPUCheckError("此服务器已有维护操作正在进行。")
+        }
+        let id = server.id
         let token = UUID().uuidString
-        let pendingDeadline = Date().addingTimeInterval(300)
-        change(server.id) { $0.busy = true; $0.idleSince = nil; $0.status = "正在复核 GPU 空闲状态" }
-        defer { change(server.id) { $0.busy = false } }
+        let deadline = Date().addingTimeInterval(300)
+        launching.insert(id)
+        change(id) { $0.busy = true; $0.status = "正在准备维护" }
+        defer { launching.remove(id); refreshBusy(id) }
         var remoteAttempted = false
         do {
-            var pending = settings[server.id] ?? IdleGuardSetting()
-            pending.idleSeconds = 0
-            pending.active = IdleGuardRun(token: token, server: server, deadline: pendingDeadline)
-            settings[server.id] = pending
+            settings[id, default: IdleGuardSetting()].active = IdleGuardRun(token: token, server: server, deadline: deadline, manual: manual)
             try saveSettings()
+            change(id) { $0.isRunning = true; $0.runningUntil = deadline }
             remoteAttempted = true
             let reply = try await request(server, script: Self.launchScript(token: token), timeout: 35)
-            guard reply.ok else { throw GPUCheckError(reply.detail ?? "启动前复核失败。") }
-            let deadline = Date().addingTimeInterval(max(0, reply.remaining ?? 300))
-            settings[server.id]?.active?.deadline = deadline
+            guard settings[id]?.active?.token == token, !stopping.contains(id) else { return }
+            guard reply.ok else { throw GPUCheckError(reply.detail ?? "维护启动失败。") }
+            let until = Date().addingTimeInterval(max(0, reply.remaining ?? 300))
+            settings[id]?.active?.deadline = until
             try saveSettings()
-            change(server.id) { $0.isRunning = true; $0.runningUntil = deadline; $0.status = "正在准备负载"; $0.detail = "全部 GPU 同时运行；远端独立看门狗将在 5 分钟期限内清理 GPUCheck 进程。" }
+            change(id) { $0.runningUntil = until; $0.status = "正在准备维护"; $0.detail = manual ? "本次为手动维护，可随时结束，最多运行 5 分钟。" : "已满足平均利用率条件，最多运行 5 分钟。" }
         } catch {
+            guard settings[id]?.active?.token == token, !stopping.contains(id) else { return }
             let stopped = remoteAttempted ? try? await request(server, script: Self.controlScript(token: token, stop: true), timeout: 18) : nil
+            guard settings[id]?.active?.token == token, !stopping.contains(id) else { return }
             if !remoteAttempted || stopped?.ok == true {
-                finish(server.id, detail: error.localizedDescription, retry: remoteAttempted)
+                finish(id, detail: error.localizedDescription, retry: !manual && remoteAttempted)
             } else {
-                change(server.id) { $0.isRunning = true; $0.runningUntil = pendingDeadline; $0.status = "启动状态待确认"; $0.detail = "\(error.localizedDescription) 已保留任务令牌，将继续核对；远端任务最多运行 5 分钟。" }
+                change(id) { $0.isRunning = true; $0.status = "启动状态待确认"; $0.detail = "\(error.localizedDescription) 已保留任务令牌，可点击结束维护。" }
             }
+            throw error
         }
     }
 
     private func finish(_ id: UUID, detail: String, retry: Bool = false) {
-        let shouldRetry = retry && settings[id]?.enabled == true
+        let retryAutomatically = retry && settings[id]?.enabled == true
         settings[id]?.active = nil
-        settings[id]?.idleSeconds = shouldRetry ? requiredIdleDuration : 0
-        settings[id]?.retryAfter = shouldRetry ? Date().addingTimeInterval(60) : nil
+        if !retryAutomatically { settings[id]?.window = nil }
+        settings[id]?.retryAfter = retryAutomatically ? Date().addingTimeInterval(60) : nil
         change(id) {
-            $0.isRunning = false; $0.runningUntil = nil; $0.idleSince = nil
-            $0.idleSeconds = settings[id]?.idleSeconds ?? 0
-            $0.enabled = settings[id]?.enabled ?? false
-            $0.status = shouldRetry ? "等待 60 秒后重试" : ($0.enabled ? "等待重新累计空闲" : "已关闭")
+            $0.isRunning = false; $0.runningUntil = nil
+            $0.idleSeconds = settings[id]?.window?.duration ?? 0
+            $0.averageLoads = settings[id]?.window?.averages ?? []
+            $0.status = retryAutomatically ? "等待 60 秒后重试" : "维护已结束"
             $0.detail = detail
         }
         lastSample[id] = nil
         try? saveSettings()
     }
-    private func change(_ id: UUID, _ body: (inout IdleGuardState) -> Void) {
-        var state = states[id] ?? IdleGuardState(); body(&state); states[id] = state
+
+    private func refreshBusy(_ id: UUID) {
+        change(id) { $0.busy = launching.contains(id) || stopping.contains(id); $0.stopping = stopping.contains(id) }
     }
+
+    private func change(_ id: UUID, _ body: (inout IdleGuardState) -> Void) {
+        var state = states[id] ?? IdleGuardState()
+        body(&state)
+        states[id] = state
+    }
+
     private func saveSettings() throws {
         try FileManager.default.createDirectory(at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try JSONEncoder().encode(settings).write(to: settingsURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: settingsURL.path)
     }
+
     private func request(_ server: Server, script: String, timeout: TimeInterval) async throws -> IdleGuardRemoteReply {
-        let data = try await client.run(server, script: script, timeout: timeout)
+        let data = try await transport(server, script, timeout)
         do { return try JSONDecoder().decode(IdleGuardRemoteReply.self, from: data) }
-        catch { throw GPUCheckError("无法解析空闲保活任务返回的信息。") }
+        catch { throw GPUCheckError("无法解析维护任务返回的信息。") }
     }
 
     static let preflightScript = #"""
@@ -301,25 +324,19 @@ import os,sys,json,time,base64,subprocess,xml.etree.ElementTree as ET,re
 sys.dont_write_bytecode=True
 token='TOKEN_VALUE'
 source=base64.b64decode('SOURCE_VALUE')
-def num(s):
-    m=re.match(r'\s*([0-9.]+)',s or '')
-    return float(m.group(1)) if m else None
-def idle_now():
+def devices_now():
     root=ET.fromstring(subprocess.check_output(['nvidia-smi','-q','-x'],timeout=10))
     gpus=root.findall('gpu')
     if not gpus:raise RuntimeError('没有 GPU。')
-    for g in gpus:
-        load=num(g.findtext('utilization/gpu_util'))
-        if load is None or not 0<=load<=2:raise RuntimeError('GPU 利用率已超过空闲阈值或无法读取，本轮取消。')
     return [g.findtext('uuid') for g in gpus]
 def start_ticks(pid):
     data=open('/proc/'+str(pid)+'/stat').read()
     return data[data.rfind(')')+2:].split()[19]
 try:
-    devices=idle_now()
+    devices=devices_now()
     import torch
     if not torch.cuda.is_available() or torch.cuda.device_count()!=len(devices):raise RuntimeError('PyTorch 无法访问全部 GPU。')
-    devices=idle_now()
+    devices=devices_now()
     folder=os.path.expanduser('~/.cache/GPUCheck/idle-guard');os.makedirs(folder,mode=0o700,exist_ok=True);os.chmod(folder,0o700)
     script=os.path.join(folder,token+'.py');statepath=os.path.join(folder,token+'.json');cancelpath=os.path.join(folder,token+'.cancel')
     if os.path.exists(cancelpath):raise RuntimeError('本轮启动已取消。')
@@ -332,7 +349,7 @@ try:
     runner=subprocess.Popen(args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,env=env)
     ticks=start_ticks(runner.pid)
     watchdog=subprocess.Popen([sys.executable,script,'--watchdog',token,statepath,str(deadline),str(runner.pid),ticks],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,env=env)
-    state={'token':token,'pid':runner.pid,'start':ticks,'watchdog':{'pid':watchdog.pid,'start':start_ticks(watchdog.pid)},'workers':[],'status':'starting','detail':'正在复核空闲状态并准备负载。','deadline':deadline,'devices':devices}
+    state={'token':token,'pid':runner.pid,'start':ticks,'watchdog':{'pid':watchdog.pid,'start':start_ticks(watchdog.pid)},'workers':[],'status':'starting','detail':'正在复核 GPU 设备并准备负载。','deadline':deadline,'devices':devices}
     temp=statepath+'.launch'
     with open(temp,'x') as f:json.dump(state,f,ensure_ascii=False)
     os.chmod(temp,0o600);os.replace(temp,statepath)
@@ -438,8 +455,6 @@ def gpu_state():
         pids={int(p.findtext('pid')) for p in gpu.findall('processes/process_info')}
         rows.append((gpu.findtext('uuid'),number(gpu.findtext('utilization/gpu_util')),number(gpu.findtext('fb_memory_usage/used')),pids))
     return rows
-def initially_idle(rows):
-    return bool(rows) and all(load is not None and 0<=load<=2 for _,load,_,_ in rows)
 def added_gpu_pids(rows,existing):
     current={uuid:pids for uuid,_,_,pids in rows}
     if current.keys()!=existing.keys():raise RuntimeError('GPU 设备列表发生变化，本轮取消。')
@@ -586,12 +601,12 @@ try:
     state=read_state()
     if cancelled():raise RuntimeError('本轮启动已被取消。')
     rows=gpu_state()
-    if not initially_idle(rows) or [r[0] for r in rows]!=state['devices']:raise RuntimeError('启动前 GPU 已变忙或设备列表发生变化，本轮取消。')
+    if not rows or [r[0] for r in rows]!=state['devices']:raise RuntimeError('GPU 设备列表发生变化，本轮取消。')
     import torch
     if not torch.cuda.is_available() or torch.cuda.device_count()!=len(rows):raise RuntimeError('PyTorch 无法访问全部 GPU。')
     # Recheck after torch import, immediately before allocating any GPU workload.
     rows=gpu_state()
-    if cancelled() or not initially_idle(rows):raise RuntimeError('分配显存前 GPU 利用率已超过空闲阈值，本轮取消。')
+    if cancelled() or [r[0] for r in rows]!=state['devices']:raise RuntimeError('维护已取消或设备列表发生变化。')
     # Existing idle processes and their VRAM are allowed; only new arrivals count as collisions.
     existing={uuid:pids for uuid,_,_,pids in rows}
     for index in range(len(rows)):

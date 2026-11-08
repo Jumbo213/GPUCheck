@@ -39,6 +39,7 @@ final class MonitorStore: ObservableObject {
                 let data = try Data(contentsOf: configURL)
                 servers = try JSONDecoder().decode([Server].self, from: data)
             } else {
+                servers = []
                 try persistServers(servers)
             }
             repository = try HistoryRepository(url: directory.appendingPathComponent("history.sqlite3"))

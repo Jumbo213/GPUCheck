@@ -33,9 +33,6 @@ import SQLite3
         precondition(store.historyDevices(serverID: server.id, since: now.addingTimeInterval(-7*86400), until: anchor).count == 2)
         let rebooted = MonitorStore(directory: folder)
         precondition(rebooted.samples(serverID: server.id, gpuUUID: "GPU-before-reallocation", since: now.addingTimeInterval(-7*86400), until: anchor).count == 1)
-        precondition(!IdleGuardManager.shouldResetIdle(peakUtilization: 3, busySeconds: 5))
-        precondition(IdleGuardManager.shouldResetIdle(peakUtilization: 3, busySeconds: 15))
-        precondition(IdleGuardManager.shouldResetIdle(peakUtilization: 10, busySeconds: 0))
         let previous = now.addingTimeInterval(-5)
         precondition(IdleGuardManager.creditedInterval(previous: previous, current: now) == 5)
         precondition(IdleGuardManager.creditedInterval(previous: now.addingTimeInterval(-600), current: now) == 0)
@@ -44,10 +41,10 @@ import SQLite3
         let encoded = "[\"\(server.id)\",{\"enabled\":true,\"idleSeconds\":17950}]"
         try Data(encoded.utf8).write(to: settings)
         let guardManager = IdleGuardManager(store: rebooted, settingsURL: settings)
-        precondition(guardManager.states[server.id]?.idleSeconds == 17950)
+        precondition(guardManager.states[server.id]?.idleSeconds == 0)
         guardManager.start()
         try await Task.sleep(nanoseconds: 100_000_000)
-        precondition(guardManager.states[server.id]?.idleSeconds == 17950)
-        print("OFFLINE_RESTART_GPU_REALLOCATION_HISTORY_AND_PAUSED_IDLE_PROGRESS_OK")
+        precondition(guardManager.states[server.id]?.idleSeconds == 0)
+        print("OFFLINE_RESTART_GPU_REALLOCATION_HISTORY_AND_FRESH_AVERAGE_MIGRATION_OK")
     }
 }
