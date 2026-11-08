@@ -45,6 +45,7 @@ final class IdleGuardManager: ObservableObject {
     private let requiredIdleDuration: TimeInterval
     private var settings: [UUID: IdleGuardSetting] = [:]
     private var pollTask: Task<Void, Never>?
+    private var configuring: Set<UUID> = []
     private var launching: Set<UUID> = []
     private var stopping: Set<UUID> = []
     private var lastProgressSave = Date.distantPast
@@ -104,9 +105,10 @@ final class IdleGuardManager: ObservableObject {
             if let active = settings[server.id]?.active, active.manual != true { try await stop(for: server) }
             return
         }
-        let previous = settings[server.id]
+        let previouslyEnabled = settings[server.id]?.enabled ?? false
+        configuring.insert(server.id)
         change(server.id) { $0.busy = true; $0.status = "正在检查运行环境" }
-        defer { refreshBusy(server.id) }
+        defer { configuring.remove(server.id); refreshBusy(server.id) }
         do {
             let reply = try await request(server, script: Self.preflightScript, timeout: 30)
             guard reply.ok else { throw GPUCheckError(reply.detail ?? "远端环境检查失败。") }
@@ -118,8 +120,9 @@ final class IdleGuardManager: ObservableObject {
             }
             lastSample[server.id] = nil
         } catch {
-            settings[server.id] = previous
-            change(server.id) { $0.enabled = previous?.enabled ?? false; $0.status = "启用失败"; $0.detail = error.localizedDescription }
+            settings[server.id, default: IdleGuardSetting()].enabled = previouslyEnabled
+            try? saveSettings()
+            change(server.id) { $0.enabled = previouslyEnabled; $0.status = "启用失败"; $0.detail = error.localizedDescription }
             throw error
         }
     }
@@ -279,7 +282,7 @@ final class IdleGuardManager: ObservableObject {
     }
 
     private func refreshBusy(_ id: UUID) {
-        change(id) { $0.busy = launching.contains(id) || stopping.contains(id); $0.stopping = stopping.contains(id) }
+        change(id) { $0.busy = configuring.contains(id) || launching.contains(id) || stopping.contains(id); $0.stopping = stopping.contains(id) }
     }
 
     private func change(_ id: UUID, _ body: (inout IdleGuardState) -> Void) {

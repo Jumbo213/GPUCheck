@@ -5,8 +5,16 @@ actor MockTransport {
     var stops = 0
     var polls = 0
     var delayLaunch = false
+    var delayPreflight = false
+    var preflights = 0
+    var preflightContinuation: CheckedContinuation<Data, Error>?
     var continuation: CheckedContinuation<Data, Error>?
     func delayed() { delayLaunch = true }
+    func delayedEnvironment() { delayPreflight = true }
+    func failEnvironment() {
+        preflightContinuation?.resume(throwing: GPUCheckError("Mock environment check failed"))
+        preflightContinuation = nil
+    }
     func release() {
         continuation?.resume(returning: Data(#"{"ok":true,"status":"starting","remaining":300}"#.utf8))
         continuation = nil
@@ -26,6 +34,10 @@ actor MockTransport {
         if script.contains("stop=False") {
             polls += 1
             return Data(#"{"ok":true,"status":"running","remaining":250}"#.utf8)
+        }
+        preflights += 1
+        if delayPreflight {
+            return try await withCheckedThrowingContinuation { preflightContinuation = $0 }
         }
         return Data(#"{"ok":true,"status":"ready"}"#.utf8)
     }
@@ -94,6 +106,30 @@ actor MockTransport {
         let restoredManual = IdleGuardManager(store: store, settingsURL: folder.appendingPathComponent("preparing.json"))
         check(restoredManual.states[server.id]?.isRunning == false, "Cancellation persists")
         print("CANCEL_DURING_PREPARATION_LATE_REPLY_AND_RESTART_OK")
+
+        let checkingMock = MockTransport()
+        let checkingURL = folder.appendingPathComponent("checking.json")
+        let checking = IdleGuardManager(store: store, settingsURL: checkingURL, transport: { _, script, _ in try await checkingMock.request(script) })
+        try await checking.startNow(for: server)
+        await checkingMock.delayedEnvironment()
+        let enable = Task { try await checking.setEnabled(true, for: server) }
+        for _ in 0..<100 {
+            if await checkingMock.preflights == 1 { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        try await checking.stop(for: server)
+        check(checking.states[server.id]?.busy == true && checking.states[server.id]?.isRunning == false, "Environment check remains busy after concurrent stop")
+        do {
+            try await checking.startNow(for: server)
+            preconditionFailure("Pending environment check must block new launch")
+        } catch {}
+        await checkingMock.failEnvironment()
+        do { try await enable.value; preconditionFailure("Environment check should fail") } catch {}
+        await checking.refresh()
+        let checkingRestored = IdleGuardManager(store: store, settingsURL: checkingURL)
+        check(checking.states[server.id]?.busy == false && checkingRestored.states[server.id]?.isRunning == false, "Failed environment check must not restore a stopped task")
+        check(await checkingMock.polls == 0, "Stopped task stays absent after failed environment check")
+        print("CONCURRENT_ENVIRONMENT_CHECK_AND_STOP_NO_STATE_RESURRECTION_OK")
 
         let autoMock = MockTransport()
         let autoURL = folder.appendingPathComponent("auto.json")
